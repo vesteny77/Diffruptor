@@ -1,1 +1,2 @@
 The VAE-GAN module.
+Trained Weights at: https://drive.google.com/drive/folders/16wZSX7l4sBCueAW892Z-tM4sttJ9l16M?usp=drive_link
