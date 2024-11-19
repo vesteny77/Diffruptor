@@ -207,3 +207,152 @@ class DiffAttackGAN:
 
         return adv_image
 
+
+class AdvDiff:
+    def __init__(self, image_size=32, device="cuda"):
+        self.unet = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to(device)
+        self.scheduler = DDIMScheduler.from_pretrained("google/ddpm-cifar10-32")
+        self.device = device
+        self.image_size = image_size
+        
+    def classifier_free_guidance(self, x_t, t, y, w=0.3):
+        """Classifier-free guidance for conditional generation"""
+        eps_t_uncond = self.unet(x_t, t).sample
+        eps_t_cond = self.unet(x_t, t, y).sample
+        eps_t = (1 + w) * eps_t_cond - w * eps_t_uncond
+        return eps_t
+
+    def adversarial_guidance(self, x_t, t, target_model, y_target, s=0.5):
+        """Adversarial guidance to fool target model"""
+        x_t.requires_grad_(True)
+        
+        pred = target_model(x_t)
+        
+        loss = F.cross_entropy(pred, y_target)
+        grad = torch.autograd.grad(loss, x_t)[0]
+        
+        # This part is the adversarial guidance
+        x_t_adv = x_t + s * self.scheduler.sigmas[t].item() ** 2 * grad
+        x_t.requires_grad_(False)
+        
+        return x_t_adv
+
+    def noise_sampling_guidance(self, x_T, x_0, target_model, y_target, a=1.0):
+        x_0.requires_grad_(True)
+        
+        pred = target_model(x_0)
+        loss = F.cross_entropy(pred, y_target)
+        grad = torch.autograd.grad(loss, x_0)[0]
+        
+        sigma_T = self.scheduler.sigmas[-1].item()
+        x_T_adv = x_T + a * sigma_T ** 2 * grad
+        x_0.requires_grad_(False)
+        
+        return x_T_adv
+
+    def generate_adversarial(
+        self,
+        target_model,
+        y_target,
+        y_true,
+        num_inference_steps=50,
+        guidance_scale=0.5,
+        adv_scale=0.5,
+        noise_guidance_scale=1.0,
+        num_noise_steps=10,
+    ):
+        self.scheduler.set_timesteps(num_inference_steps)
+        
+        x_t = torch.randn(1, 3, self.image_size, self.image_size).to(self.device)
+        
+        # adversarial examples
+        x_adv = None
+        
+        for _ in range(num_noise_steps):
+            # Reverse diffusion process
+            for t in tqdm(self.scheduler.timesteps):
+                eps_t = self.classifier_free_guidance(x_t, t, y_true, guidance_scale)
+                
+                x_t = self.scheduler.step(eps_t, t, x_t).prev_sample
+                
+                x_t = self.adversarial_guidance(x_t, t, target_model, y_target, adv_scale)
+            
+            x_0 = x_t
+            
+            with torch.no_grad():
+                pred = target_model(x_0)
+                if pred.argmax() == y_target:
+                    x_adv = x_0
+                    break
+            
+            x_t = self.noise_sampling_guidance(x_t, x_0, target_model, y_target, noise_guidance_scale)
+        
+        return x_adv
+
+    def attack_vae_gan(
+        self,
+        vae_encoder,
+        vae_decoder,
+        discriminator,
+        image,
+        num_inference_steps=50,
+        guidance_scale=0.3,
+        adv_scale=0.5,
+        noise_guidance_scale=1.0,
+    ):
+        class VAEGANTarget(nn.Module):
+            def __init__(self, encoder, decoder, discriminator):
+                super().__init__()
+                self.encoder = encoder
+                self.decoder = decoder
+                self.discriminator = discriminator
+                
+            def forward(self, x):
+                mu, logvar = self.encoder(x)
+                z = self.reparameterize(mu, logvar)
+                recon = self.decoder(z)
+                return self.discriminator(recon)
+                
+            def reparameterize(self, mu, logvar):
+                std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                return mu + eps * std
+        
+        target_model = VAEGANTarget(vae_encoder, vae_decoder, discriminator).to(self.device)
+        target_model.eval()
+        
+        y_target = torch.zeros(1).to(self.device) if image.mean() > 0.5 else torch.ones(1).to(self.device)
+        y_true = torch.ones(1).to(self.device) if image.mean() > 0.5 else torch.zeros(1).to(self.device)
+        
+        x_adv = self.generate_adversarial(
+            target_model,
+            y_target,
+            y_true,
+            num_inference_steps,
+            guidance_scale,
+            adv_scale,
+            noise_guidance_scale
+        )
+        
+        return x_adv
+
+
+# def attack_advdiff():
+#     advdiff = AdvDiff(image_size=32)
+
+#     vae_encoder = Encoder().cuda()
+#     vae_decoder = Decoder().cuda()
+#     discriminator = Discriminator().cuda()
+
+#     x_adv = advdiff.attack_vae_gan(
+#         vae_encoder,
+#         vae_decoder,
+#         discriminator,
+#         image,
+#         num_inference_steps=50,
+#         guidance_scale=0.3,
+#         adv_scale=0.5,
+#         noise_guidance_scale=1.0
+#     )
+
+#     return x_adv

@@ -32,6 +32,7 @@ def produce_graph(a, b, c, d):
     # Save the grid image as a PNG file
     grid_image.save('result.png')
 
+
 def main():
     transform = transforms.Compose([
         transforms.Resize(32),
