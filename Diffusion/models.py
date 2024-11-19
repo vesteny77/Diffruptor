@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from diffusers import DDIMScheduler, UNet2DModel, AutoencoderKL
 from tqdm import tqdm
@@ -356,3 +357,135 @@ class AdvDiff:
 #     )
 
 #     return x_adv
+
+
+class DiffAttack2:
+    def __init__(self, image_size=32, device="cuda"):
+        self.device = device
+        self.image_size = image_size
+        self.unet = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to(device)
+        self.scheduler = DDIMScheduler.from_pretrained("google/ddpm-cifar10-32")
+        self.perceptual_loss = lpips.LPIPS(net='alex').to(device)
+        
+    def segment_wise_backward(self, loss_fn, x_t, timesteps, start_idx, end_idx):
+        """gradient backpropagation for a segment of timesteps"""
+        grad = None
+        for t in reversed(timesteps[start_idx:end_idx]):
+            x_t.requires_grad_(True)
+            noise_pred = self.unet(x_t, t).sample # store intermediate samples
+            next_x = self.scheduler.step(noise_pred, t, x_t).prev_sample
+            
+            if t == timesteps[end_idx - 1]:
+                loss = loss_fn(next_x)
+                grad = torch.autograd.grad(loss, x_t)[0]
+            else:
+                grad = torch.autograd.grad((next_x * grad).sum(), x_t)[0]
+            
+            x_t = x_t.detach()
+            x_t -= grad
+            
+        return x_t, grad
+
+    def deviated_reconstruction_loss(self, x_t, x_t_orig, t):
+        """the deviated-reconstruction loss"""
+        diff = x_t - x_t_orig
+        loss = torch.mean(diff ** 2)
+        alpha = 1.0 / (1.0 + t.item()) # TODO: adjust this for validation
+        return alpha * loss
+
+    def ddim_inversion(self, image, num_inference_steps=20):
+        """DDIM inversion process"""
+        self.scheduler.set_timesteps(num_inference_steps)
+        
+        latent = image.to(self.device)
+        all_latents = [latent]  # initial latents
+        
+        for t in tqdm(self.scheduler.timesteps, desc="DDIM Inversion"):
+            with torch.no_grad():
+                noise_pred = self.unet(latent, t).sample
+                latent = self.scheduler.step(noise_pred, t, latent).prev_sample
+                all_latents.append(latent)
+                
+        return latent, all_latents
+
+    def attack(
+        self,
+        image,
+        vae_encoder,
+        vae_decoder,
+        discriminator,
+        num_inference_steps=20,
+        attack_steps=100,
+        lr=0.01,
+        segment_size=5,
+    ):
+        vae_encoder.eval()
+        vae_decoder.eval()
+        discriminator.eval()
+        self.unet.eval()
+        
+        latent, all_latents = self.ddim_inversion(image, num_inference_steps)
+        latent = latent.detach().requires_grad_(True)
+        
+        optimizer = optim.AdamW([latent], lr=lr)
+        
+        self.scheduler.set_timesteps(num_inference_steps)
+        timesteps = self.scheduler.timesteps
+        
+        for step in tqdm(range(attack_steps), desc="DiffAttack2 Progress"):
+            optimizer.zero_grad()
+            
+            current_latent = latent
+            total_loss = 0
+            
+            for seg_start in range(0, len(timesteps), segment_size):
+                seg_end = min(seg_start + segment_size, len(timesteps))
+                
+                def segment_loss(x):
+                    mu, logvar = vae_encoder(x)
+                    z = torch.randn_like(mu) * torch.exp(0.5 * logvar) + mu
+                    recon = vae_decoder(z)
+                    
+                    disc_out = discriminator(recon)
+                    target = torch.zeros_like(disc_out) if disc_out.mean() > 0.5 else torch.ones_like(disc_out)
+                    adv_loss = F.binary_cross_entropy(disc_out, target)
+                    
+                    dev_loss = self.deviated_reconstruction_loss(x, image, timesteps[seg_end-1])
+                    
+                    content_loss = F.mse_loss(x, image)
+                    
+                    perc_loss = self.perceptual_loss(x, image)
+                    
+                    return (
+                        adv_loss + 
+                        0.1 * dev_loss +
+                        10.0 * content_loss +
+                        5.0 * perc_loss
+                    )
+                
+                current_latent, grad = self.segment_wise_backward(
+                    segment_loss, 
+                    current_latent,
+                    timesteps,
+                    seg_start,
+                    seg_end
+                )
+                
+                if grad is not None:
+                    total_loss += grad.norm()
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            with torch.no_grad():
+                delta = latent - image
+                delta = torch.clamp(delta, -8/255, 8/255)  # Epsilon constraint
+                latent.data = image + delta
+        
+        with torch.no_grad():
+            adv_image = latent
+            for t in self.scheduler.timesteps:
+                noise_pred = self.unet(adv_image, t).sample
+                adv_image = self.scheduler.step(noise_pred, t, adv_image).prev_sample
+        
+        return adv_image
