@@ -366,47 +366,26 @@ class DiffAttack2:
         self.unet = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to(device)
         self.scheduler = DDIMScheduler.from_pretrained("google/ddpm-cifar10-32")
         self.perceptual_loss = lpips.LPIPS(net='alex').to(device)
-        
-    def segment_wise_backward(self, loss_fn, x_t, timesteps, start_idx, end_idx):
-        """gradient backpropagation for a segment of timesteps"""
-        grad = None
-        for t in reversed(timesteps[start_idx:end_idx]):
-            x_t.requires_grad_(True)
-            noise_pred = self.unet(x_t, t).sample # store intermediate samples
-            next_x = self.scheduler.step(noise_pred, t, x_t).prev_sample
-            
-            if t == timesteps[end_idx - 1]:
-                loss = loss_fn(next_x)
-                grad = torch.autograd.grad(loss, x_t)[0]
-            else:
-                grad = torch.autograd.grad((next_x * grad).sum(), x_t)[0]
-            
-            x_t = x_t.detach()
-            x_t -= grad
-            
-        return x_t, grad
-
-    def deviated_reconstruction_loss(self, x_t, x_t_orig, t):
-        """the deviated-reconstruction loss"""
-        diff = x_t - x_t_orig
-        loss = torch.mean(diff ** 2)
-        alpha = 1.0 / (1.0 + t.item()) # TODO: adjust this for validation
-        return alpha * loss
-
-    def ddim_inversion(self, image, num_inference_steps=20):
-        """DDIM inversion process"""
+    
+    def ddim_forward_to_timestep(self, image, target_timestep, num_inference_steps=20):
+        """forward diffusion up to a specific timestep"""
         self.scheduler.set_timesteps(num_inference_steps)
         
         latent = image.to(self.device)
-        all_latents = [latent]  # initial latents
+        timesteps = self.scheduler.timesteps
         
-        for t in tqdm(self.scheduler.timesteps, desc="DDIM Inversion"):
+        for t in timesteps[:target_timestep]:
             with torch.no_grad():
                 noise_pred = self.unet(latent, t).sample
                 latent = self.scheduler.step(noise_pred, t, latent).prev_sample
-                all_latents.append(latent)
-                
-        return latent, all_latents
+        
+        return latent, timesteps[target_timestep:]
+
+    def sample_uniform_timesteps(self, total_steps, num_samples):
+        """sample timesteps uniformly"""
+        indices = torch.linspace(0, total_steps - 1, num_samples)
+        indices = indices.long()
+        return indices
 
     def attack(
         self,
@@ -415,6 +394,8 @@ class DiffAttack2:
         vae_decoder,
         discriminator,
         num_inference_steps=20,
+        start_timestep=10,
+        num_sampling_steps=5,  # uniform samples for reconstruction loss
         attack_steps=100,
         lr=0.01,
         segment_size=5,
@@ -424,22 +405,28 @@ class DiffAttack2:
         discriminator.eval()
         self.unet.eval()
         
-        latent, all_latents = self.ddim_inversion(image, num_inference_steps)
+        latent, remaining_timesteps = self.ddim_forward_to_timestep(
+            image, 
+            start_timestep, 
+            num_inference_steps
+        )
         latent = latent.detach().requires_grad_(True)
+        
+        sampling_timesteps = self.sample_uniform_timesteps(
+            len(remaining_timesteps), 
+            num_sampling_steps
+        )
         
         optimizer = optim.AdamW([latent], lr=lr)
         
-        self.scheduler.set_timesteps(num_inference_steps)
-        timesteps = self.scheduler.timesteps
-        
-        for step in tqdm(range(attack_steps), desc="DiffAttack2 Progress"):
+        for step in tqdm(range(attack_steps), desc="DiffAttack2 Running"):
             optimizer.zero_grad()
             
             current_latent = latent
             total_loss = 0
             
-            for seg_start in range(0, len(timesteps), segment_size):
-                seg_end = min(seg_start + segment_size, len(timesteps))
+            for seg_start in range(0, len(remaining_timesteps), segment_size):
+                seg_end = min(seg_start + segment_size, len(remaining_timesteps))
                 
                 def segment_loss(x):
                     mu, logvar = vae_encoder(x)
@@ -450,7 +437,9 @@ class DiffAttack2:
                     target = torch.zeros_like(disc_out) if disc_out.mean() > 0.5 else torch.ones_like(disc_out)
                     adv_loss = F.binary_cross_entropy(disc_out, target)
                     
-                    dev_loss = self.deviated_reconstruction_loss(x, image, timesteps[seg_end-1])
+                    dev_loss = 0
+                    if seg_end - 1 in sampling_timesteps:
+                        dev_loss = self.deviated_reconstruction_loss(x, image, remaining_timesteps[seg_end-1])
                     
                     content_loss = F.mse_loss(x, image)
                     
@@ -466,7 +455,7 @@ class DiffAttack2:
                 current_latent, grad = self.segment_wise_backward(
                     segment_loss, 
                     current_latent,
-                    timesteps,
+                    remaining_timesteps,
                     seg_start,
                     seg_end
                 )
@@ -479,12 +468,12 @@ class DiffAttack2:
             
             with torch.no_grad():
                 delta = latent - image
-                delta = torch.clamp(delta, -8/255, 8/255)  # Epsilon constraint
+                delta = torch.clamp(delta, -8/255, 8/255)
                 latent.data = image + delta
         
         with torch.no_grad():
             adv_image = latent
-            for t in self.scheduler.timesteps:
+            for t in remaining_timesteps:
                 noise_pred = self.unet(adv_image, t).sample
                 adv_image = self.scheduler.step(noise_pred, t, adv_image).prev_sample
         
