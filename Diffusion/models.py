@@ -387,6 +387,31 @@ class DiffAttack2:
         indices = indices.long()
         return indices
 
+    def segment_wise_backward(self, loss_fn, x_t, timesteps, start_idx, end_idx):
+        grad = None
+        for t in reversed(timesteps[start_idx:end_idx]):
+            # store intermediate values
+            x_t.requires_grad_(True)
+            noise_pred = self.unet(x_t, t).sample
+            next_x = self.scheduler.step(noise_pred, t, x_t).prev_sample
+            
+            if t == timesteps[end_idx - 1]:
+                loss = loss_fn(next_x)
+                grad = torch.autograd.grad(loss, x_t)[0]
+            else:
+                grad = torch.autograd.grad((next_x * grad).sum(), x_t)[0]
+            
+            x_t = x_t.detach()
+            x_t = x_t - grad
+            
+        return x_t, grad
+
+    def deviated_reconstruction_loss(self, x_t, x_t_orig, t):
+        diff = x_t - x_t_orig
+        loss = torch.mean(diff ** 2)
+        alpha = 1.0 / (1.0 + t.item())
+        return alpha * loss
+
     def attack(
         self,
         image,
